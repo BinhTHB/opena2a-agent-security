@@ -1,0 +1,95 @@
+"""
+AIM Python SDK Setup
+"""
+
+from setuptools import setup, find_packages
+import os
+
+# Read version from VERSION file (single source of truth)
+version_file = os.path.join(os.path.dirname(__file__), "VERSION")
+with open(version_file, "r", encoding="utf-8") as vf:
+    version = vf.read().strip()
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setup(
+    name="aim-sdk",
+    version=version,
+    author="OpenA2A",
+    author_email="info@opena2a.org",
+    description="Python SDK for AIM (Agent Identity Management) - Automatic identity verification for AI agents",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://opena2a.org/agent-identity-management",
+    license="Apache-2.0",
+    packages=find_packages(exclude=["tests", "tests.*"]),
+    classifiers=[
+        "Development Status :: 5 - Production/Stable",
+        "Intended Audience :: Developers",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+        "Topic :: Security :: Cryptography",
+        "License :: OSI Approved :: Apache Software License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+    ],
+    # Keep the upper bound in step with the classifier list above: every minor
+    # version this range admits must carry a classifier.
+    python_requires=">=3.8,<3.15",
+    install_requires=[
+        "requests>=2.28.0",
+        "PyNaCl>=1.5.0",  # Ed25519 signing
+        "cryptography>=43.0.1",  # REQUIRED: Secure credential encryption (CVE-2023-50782 fix)
+        "keyring>=24.0.0",  # REQUIRED: System keyring for encryption keys
+        "PyJWT>=2.8.0",  # JWT parsing with structure validation
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0.0",
+            "pytest-cov>=4.0.0",
+            "pytest-mock>=3.10.0",
+            "responses>=0.23.0",
+            "black>=24.3.0",  # CVE-2024-48 fix
+            "flake8>=6.0.0",
+            "mypy>=1.0.0",
+            "ruff>=0.5.0",  # tests/test_lint_ruff.py
+        ],
+        "mcp": [
+            "mcp>=1.23.0",  # Official MCP SDK (CVE-2025-53366, CVE-2025-66416 fix)
+            "anyio>=4.0.0",  # Async runtime for MCP client
+        ],
+        # The distributions aim_sdk.integrations.langchain and .crewai import,
+        # pinned to the versions the framework integration tests
+        # (scripts/test-sdk-python-framework-integration.sh) run against.
+        "langchain": [
+            "langchain-core==1.6.12",
+            "pydantic==2.12.5",
+        ],
+        "crewai": [
+            "crewai==1.15.28",
+        ],
+        "rich": [
+            "rich>=13.0.0",  # Beautiful terminal output (Stripe-style formatting)
+        ],
+        "pqc": [
+            "liboqs-python>=0.9.0",  # Post-quantum cryptography (ML-DSA/Dilithium)
+        ],
+    },
+    keywords="aim agent identity management verification security cryptography ed25519",
+    project_urls={
+        "Bug Reports": "https://github.com/opena2a-org/agent-identity-management/issues",
+        "Source": "https://github.com/opena2a-org/agent-identity-management",
+        "Documentation": "https://opena2a.org/docs/aim",
+    },
+    entry_points={
+        "console_scripts": [
+            "aim-sdk=aim_sdk.cli:main",
+        ],
+    },
+)

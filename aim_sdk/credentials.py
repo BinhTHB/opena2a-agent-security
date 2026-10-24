@@ -1,0 +1,931 @@
+"""
+Centralized Credential Management for AIM SDK.
+
+This module provides a clean separation between:
+1. SDK credentials (OAuth tokens for authenticating the SDK itself)
+2. Agent credentials (Ed25519 keys for registered agents)
+
+Directory Structure:
+    ~/.aim/
+    ├── sdk_credentials.json      # SDK OAuth tokens
+    ├── agents/
+    │   ├── my-agent.json         # Agent "my-agent" keys
+    │   └── other-agent.json      # Agent "other-agent" keys
+    └── credentials.json          # LEGACY (auto-migrated)
+
+This design ensures:
+- No credential collisions (SDK auth vs Agent auth)
+- Per-agent isolation (each agent has its own file)
+- Clear error messages when wrong credential type found
+- Automatic migration from legacy format
+"""
+
+import os
+import sys
+import json
+import errno
+import stat
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+# Security logging for SOC monitoring
+from .security_logging import security_logger, CredEventType
+
+
+# =============================================================================
+# PATH CONSTANTS
+# =============================================================================
+
+AIM_DIR = Path.home() / ".aim"
+SDK_CREDENTIALS_FILE = AIM_DIR / "sdk_credentials.json"
+AGENTS_DIR = AIM_DIR / "agents"
+LEGACY_CREDENTIALS_FILE = AIM_DIR / "credentials.json"
+
+# Schema version for future evolution
+SCHEMA_VERSION = "1.0"
+
+# How long a process waits for another process's refresh of the SDK credentials
+# before giving up on its own. The holder makes at most two HTTP calls (refresh,
+# then recovery), each with a 10-second timeout.
+SDK_CREDENTIALS_LOCK_TIMEOUT = 60.0
+
+
+# =============================================================================
+# CREDENTIAL TYPE DETECTION
+# =============================================================================
+
+class CredentialType:
+    """Types of credentials in the AIM ecosystem."""
+    SDK_OAUTH = "sdk_oauth"      # SDK authentication (refreshToken, sdkTokenId)
+    AGENT = "agent"              # Agent keys (agentId, privateKey)
+    UNKNOWN = "unknown"          # Unrecognized format
+
+
+class CredentialOrigin:
+    """Where an SDK OAuth credential came from. It decides the recovery command."""
+    LOGIN = "login"                # written by `aim-sdk login` (device grant)
+    SDK_DOWNLOAD = "sdk_download"  # bundled with an SDK downloaded from the dashboard
+
+
+# Keys only `aim-sdk login` writes into sdk_credentials.json. The dashboard's
+# download bundle carries neither, and no refresh or recovery adds them.
+# sdkTokenId, schemaVersion and type do NOT tell the two apart: every save
+# stamps schemaVersion and type, and every token rotation writes sdkTokenId.
+_LOGIN_ONLY_KEYS = ("accessToken", "organizationId")
+
+
+def detect_credential_origin(data: Optional[Dict[str, Any]]) -> str:
+    """Tell a credential written by ``aim-sdk login`` from an SDK-download one.
+
+    Anything not recognisably a login credential, including no data at all, is
+    treated as an SDK download, which keeps the long-standing recovery advice
+    for every older file.
+    """
+    if isinstance(data, dict) and any(key in data for key in _LOGIN_ONLY_KEYS):
+        return CredentialOrigin.LOGIN
+    return CredentialOrigin.SDK_DOWNLOAD
+
+
+def detect_credential_type(data: Dict[str, Any]) -> str:
+    """
+    Detect the type of credentials from their structure.
+
+    Args:
+        data: Parsed JSON credential data
+
+    Returns:
+        CredentialType constant
+    """
+    # SDK OAuth credentials have refreshToken
+    if "refreshToken" in data or "refresh_token" in data:
+        return CredentialType.SDK_OAUTH
+
+    # Agent credentials have agent_id or agentId and private_key or privateKey
+    has_agent_id = "agent_id" in data or "agentId" in data
+    has_private_key = "private_key" in data or "privateKey" in data
+    if has_agent_id or has_private_key:
+        return CredentialType.AGENT
+
+    # Check for nested agent credentials (old format: {"agent-name": {...}})
+    for key, value in data.items():
+        if isinstance(value, dict):
+            if "agent_id" in value or "private_key" in value:
+                return CredentialType.AGENT
+
+    return CredentialType.UNKNOWN
+
+
+# =============================================================================
+# SDK CREDENTIALS (OAuth tokens for SDK authentication)
+# =============================================================================
+
+def get_sdk_credentials_path() -> Path:
+    """Get the path to SDK credentials file."""
+    return SDK_CREDENTIALS_FILE
+
+
+class SDKCredentialsLockTimeout(TimeoutError):
+    """Another process held the SDK credentials lock for longer than the timeout."""
+
+
+_lock_depth = threading.local()
+
+
+def get_sdk_credentials_lock_path() -> Path:
+    """The lock file that serializes refreshes of the SDK credentials file.
+
+    It sits next to the credentials file and is never replaced: the
+    credentials file itself is replaced on every save, so a lock taken on it
+    would not be seen by a process that opened the new file. It is removed
+    only with the credentials it guards, by ``remove_sdk_credentials_lock``.
+    """
+    return SDK_CREDENTIALS_FILE.with_name(SDK_CREDENTIALS_FILE.name + ".lock")
+
+
+def _try_lock(fd: int) -> bool:
+    try:
+        if sys.platform == "win32":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as e:
+        if sys.platform != "win32" and e.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            raise
+        return False
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextmanager
+def sdk_credentials_lock(timeout: Optional[float] = None):
+    """Hold the cross-process lock on the SDK credentials file.
+
+    Refresh tokens are single-use, so two processes sharing the credentials file
+    must not both present the stored token: the one that loses the race presents
+    a token the other already rotated, which the server refuses, and for a sign-in
+    from ``aim-sdk login`` the server then ends the sign-in for both.
+    Holding this lock across read, refresh and save makes the refresh happen
+    once. The lock is reentrant within a thread, so a save made while it is held
+    does not wait on itself.
+
+    The lock keeps processes of this SDK apart. On Linux it does not keep a
+    process of this SDK apart from a process of the Java SDK. That SDK locks the
+    same file with a record lock (``FileChannel.tryLock``), which Linux holds
+    separately from the ``flock`` taken here, so each takes its lock while the
+    other holds its own. On macOS the two locks exclude each other.
+
+    The lock is held on the file the lock path names once it is taken: a lock
+    on a file that was removed while this process waited for it is let go and
+    the path opened again (see ``remove_sdk_credentials_lock``).
+
+    Raises:
+        SDKCredentialsLockTimeout: another holder kept the lock past ``timeout``
+            seconds (default ``SDK_CREDENTIALS_LOCK_TIMEOUT``).
+    """
+    path = get_sdk_credentials_lock_path()
+    key = str(path)
+    held = getattr(_lock_depth, "held", None)
+    if held is None:
+        held = _lock_depth.held = {}
+
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+
+    wait = SDK_CREDENTIALS_LOCK_TIMEOUT if timeout is None else timeout
+    fd = _lock_named_file(path, time.monotonic() + wait, wait)
+    try:
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held[key] = 0
+            _unlock(fd)
+    finally:
+        os.close(fd)
+
+
+def _names_open_file(path: Path, fd: int) -> bool:
+    """Whether ``path`` names the file open on ``fd``."""
+    try:
+        named = os.stat(path)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(fd)
+    return (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _lock_named_file(path: Path, deadline: float, wait: float) -> int:
+    """Open and lock the file at ``path``; return its descriptor, locked.
+
+    A process that opened the lock file before ``remove_sdk_credentials_lock``
+    removed it locks a file no process opening the path afterwards sees, so
+    holding that lock would keep nobody out. Such a lock is let go and the path
+    opened again, until ``deadline``.
+    """
+    while True:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            while not _try_lock(fd):
+                if time.monotonic() >= deadline:
+                    raise SDKCredentialsLockTimeout(
+                        f"Another process held {path} for more than {wait:g} seconds"
+                    )
+                time.sleep(0.05)
+            if _names_open_file(path, fd):
+                return fd
+            _unlock(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+        if time.monotonic() >= deadline:
+            raise SDKCredentialsLockTimeout(
+                f"Could not lock {path} within {wait:g} seconds: it was removed "
+                f"while this process waited for it"
+            )
+
+
+def remove_sdk_credentials_lock() -> None:
+    """Remove the lock file once the SDK credentials file it guards is gone.
+
+    ``aim-sdk logout`` calls this after deleting the credentials. The lock is
+    taken without waiting, and the file is removed while it is held and only
+    when no credentials file exists by then. A process of this SDK that opened
+    the lock file before the removal finds, once it holds the lock, that the
+    path no longer names that file, and opens the path again
+    (``_lock_named_file``). A process of the Java SDK makes no such check: one
+    that opened the file before the removal holds, for that one locked action,
+    a lock on the removed file.
+
+    The file is left in place when another holder has the lock, when the
+    credentials file exists again, or when the removal fails.
+    """
+    path = get_sdk_credentials_lock_path()
+    if not path.exists():
+        return
+    try:
+        with sdk_credentials_lock(timeout=0):
+            if SDK_CREDENTIALS_FILE.exists():
+                return
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _write_private_json(path: Path, data: Dict[str, Any]) -> None:
+    """Replace ``path`` with ``data`` in one step, readable by the owner only.
+
+    A reader in another process sees the old file or the new one, never a
+    truncated one, except on Windows when another process has the file open:
+    the replace is refused there and the file is rewritten in place.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp, str(path))
+        except PermissionError:
+            if sys.platform != "win32":
+                raise
+            # Windows refuses to replace a file another process has open.
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
+
+
+def read_sdk_credentials_file() -> Optional[Dict[str, Any]]:
+    """Read the SDK credentials file alone, with no migration or discovery.
+
+    Returns None when the file is missing, unreadable or not SDK credentials.
+    """
+    try:
+        with open(SDK_CREDENTIALS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and detect_credential_type(data) == CredentialType.SDK_OAUTH:
+        return data
+    return None
+
+
+def load_sdk_credentials() -> Optional[Dict[str, Any]]:
+    """
+    Load SDK OAuth credentials with intelligent fallback and migration.
+
+    Lookup order:
+    1. ~/.aim/sdk_credentials.json (new location)
+    2. ~/.aim/credentials.json (legacy - migrate if SDK type)
+    3. SDK package .aim/sdk_credentials.json (fresh download)
+
+    Returns:
+        SDK credentials dict or None if not found
+    """
+    # 1. Check new location first
+    if SDK_CREDENTIALS_FILE.exists():
+        try:
+            with open(SDK_CREDENTIALS_FILE, 'r') as f:
+                data = json.load(f)
+            if detect_credential_type(data) == CredentialType.SDK_OAUTH:
+                security_logger.log_credential_event(
+                    CredEventType.CREDENTIAL_LOADED,
+                    credential_type="sdk_oauth",
+                    success=True,
+                    details={"source": "sdk_credentials.json", "token_id": data.get("sdkTokenId", "")[:8] + "..."}
+                )
+                return data
+        except Exception as e:
+            security_logger.log_credential_event(
+                CredEventType.CREDENTIAL_LOADED,
+                credential_type="sdk_oauth",
+                success=False,
+                error=str(e),
+                details={"source": "sdk_credentials.json"}
+            )
+
+    # 2. Check legacy location and migrate if SDK type
+    if LEGACY_CREDENTIALS_FILE.exists():
+        try:
+            with open(LEGACY_CREDENTIALS_FILE, 'r') as f:
+                data = json.load(f)
+
+            cred_type = detect_credential_type(data)
+
+            if cred_type == CredentialType.SDK_OAUTH:
+                # Migrate to new location
+                _migrate_sdk_credentials(data)
+                security_logger.log_credential_event(
+                    CredEventType.CREDENTIAL_MIGRATED,
+                    credential_type="sdk_oauth",
+                    success=True,
+                    details={"from": "credentials.json", "to": "sdk_credentials.json"}
+                )
+                return data
+
+            elif cred_type == CredentialType.AGENT:
+                # Agent credentials in legacy location - migrate them too
+                _migrate_legacy_agent_credentials(data)
+                security_logger.log_credential_event(
+                    CredEventType.CREDENTIAL_TYPE_MISMATCH,
+                    credential_type="agent",
+                    success=False,
+                    details={"expected": "sdk_oauth", "found": "agent", "source": "credentials.json"}
+                )
+                # Fall through to check SDK package
+
+        except Exception as e:
+            security_logger.log_credential_event(
+                CredEventType.CREDENTIAL_LOADED,
+                credential_type="sdk_oauth",
+                success=False,
+                error=str(e),
+                details={"source": "credentials.json (legacy)"}
+            )
+
+    # 3. Check SDK package for fresh download
+    found = _find_sdk_package_credentials()
+    if found:
+        sdk_package_creds, source_path = found
+        # Install to home directory
+        _install_sdk_credentials(sdk_package_creds, source_path)
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_CREATED,
+            credential_type="sdk_oauth",
+            success=True,
+            details={"source": str(source_path), "installed_to": "sdk_credentials.json"}
+        )
+        return sdk_package_creds
+
+    security_logger.log_credential_event(
+        CredEventType.CREDENTIAL_LOADED,
+        credential_type="sdk_oauth",
+        success=False,
+        error="SDK credentials not found in any location"
+    )
+    return None
+
+
+def save_sdk_credentials(credentials: Dict[str, Any]) -> bool:
+    """
+    Save SDK OAuth credentials to the proper location.
+
+    Args:
+        credentials: SDK credentials dict
+
+    Returns:
+        True if saved successfully
+    """
+    try:
+        AIM_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Add schema info
+        credentials["schemaVersion"] = SCHEMA_VERSION
+        credentials["type"] = CredentialType.SDK_OAUTH
+
+        with sdk_credentials_lock():
+            SDK_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _write_private_json(SDK_CREDENTIALS_FILE, credentials)
+
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_SAVED,
+            credential_type="sdk_oauth",
+            success=True,
+            details={"path": str(SDK_CREDENTIALS_FILE), "permissions": "0600"}
+        )
+        return True
+    except Exception as e:
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_SAVED,
+            credential_type="sdk_oauth",
+            success=False,
+            error=str(e)
+        )
+        print(f"Warning: Failed to save SDK credentials: {e}", file=sys.stderr)
+        return False
+
+
+def _find_sdk_package_credentials() -> Optional[Tuple[Dict[str, Any], Path]]:
+    """
+    Find SDK credentials in the installed package (for fresh downloads).
+
+    Search order:
+    1. Current working directory .aim/sdk_credentials.json
+    2. SDK package root .aim/sdk_credentials.json
+    3. Legacy locations with credentials.json
+    """
+    search_paths = []
+
+    # 1. Current working directory (when user runs from extracted SDK folder)
+    cwd = Path.cwd()
+    search_paths.append(cwd / ".aim" / "sdk_credentials.json")
+    search_paths.append(cwd / ".aim" / "credentials.json")
+
+    # 2. SDK package installation directory
+    try:
+        import aim_sdk
+        sdk_root = Path(aim_sdk.__file__).parent.parent
+        search_paths.append(sdk_root / ".aim" / "sdk_credentials.json")
+        search_paths.append(sdk_root / ".aim" / "credentials.json")
+    except Exception:
+        pass
+
+    # 3. Parent directories (if running from subdirectory of SDK)
+    for parent in cwd.parents:
+        aim_dir = parent / ".aim"
+        if aim_dir.exists():
+            search_paths.append(aim_dir / "sdk_credentials.json")
+            search_paths.append(aim_dir / "credentials.json")
+            break  # Only check first parent with .aim
+
+    # Search all paths
+    for path in search_paths:
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                if detect_credential_type(data) == CredentialType.SDK_OAUTH:
+                    return data, path
+            except Exception:
+                continue
+
+    return None
+
+
+def _install_sdk_credentials(credentials: Dict[str, Any], source_path: Optional[Path] = None) -> None:
+    """Adopt SDK credentials discovered on this machine into the home directory.
+
+    The credentials are read from the first existing path in the search order
+    (CWD, the installed package dir, or the nearest ancestor ``.aim/``) -- they
+    are NOT baked into the published package. The home location is the long-term
+    source of truth; on subsequent runs the SDK reads from there first and
+    ignores the discovered file (#178).
+    """
+    try:
+        token_id = credentials.get("sdkTokenId") or credentials.get("sdk_token_id") or ""
+        token_id_short = (token_id[:8] + "...") if token_id else "unknown"
+        # Name the ACTUAL source path so this line is never mistaken for a
+        # credential shipped inside the package -- it is not (see docstring).
+        # Audit #37: the silent install path was how stale tokens crept into the
+        # home file across demo-prep runs, so the adoption stays visible.
+        origin = str(source_path) if source_path else "a discovered .aim directory"
+        print(
+            f"INFO: Adopting existing SDK credentials found at {origin} "
+            f"(token {token_id_short}). Long-term source: {SDK_CREDENTIALS_FILE}.",
+            file=sys.stderr,
+        )
+        if save_sdk_credentials(credentials):
+            print(f"SDK credentials installed to {SDK_CREDENTIALS_FILE}", file=sys.stderr)
+        else:
+            print(f"SDK credentials were not installed to {SDK_CREDENTIALS_FILE}; "
+                  f"using them from {origin} for this run only.", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to install SDK credentials: {e}", file=sys.stderr)
+
+
+def _migrate_sdk_credentials(credentials: Dict[str, Any]) -> None:
+    """Migrate SDK credentials from legacy to new location."""
+    try:
+        # save_sdk_credentials reports its own failure and returns False; the
+        # [OK] line used to print regardless, over a file that was never
+        # written (#409).
+        if save_sdk_credentials(credentials):
+            print(f"[OK] SDK credentials migrated to {SDK_CREDENTIALS_FILE}", file=sys.stderr)
+        else:
+            print(f"SDK credentials were not migrated to {SDK_CREDENTIALS_FILE}; "
+                  f"still reading them from {LEGACY_CREDENTIALS_FILE}.", file=sys.stderr)
+    except Exception:
+        pass
+
+
+# =============================================================================
+# AGENT CREDENTIALS (Ed25519 keys for registered agents)
+# =============================================================================
+
+def get_agent_credentials_path(agent_name: str) -> Path:
+    """Get the path to an agent's credentials file."""
+    # Sanitize agent name for filesystem
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in agent_name)
+    return AGENTS_DIR / f"{safe_name}.json"
+
+
+def load_agent_credentials(agent_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Load credentials for a specific agent.
+
+    Lookup order:
+    1. ~/.aim/agents/{agent_name}.json (new location)
+    2. ~/.aim/credentials.json with nested agent data (legacy)
+
+    Args:
+        agent_name: Name of the agent
+
+    Returns:
+        Agent credentials dict or None if not found
+    """
+    # 1. Check new location
+    agent_file = get_agent_credentials_path(agent_name)
+    if agent_file.exists():
+        try:
+            with open(agent_file, 'r') as f:
+                data = json.load(f)
+            agent_id = data.get("agent_id", "")
+            security_logger.log_credential_event(
+                CredEventType.CREDENTIAL_LOADED,
+                credential_type="agent",
+                agent_name=agent_name,
+                success=True,
+                details={"source": f"agents/{agent_name}.json", "agent_id": (agent_id[:8] + "...") if agent_id else None}
+            )
+            return data
+        except Exception as e:
+            security_logger.log_credential_event(
+                CredEventType.CREDENTIAL_LOADED,
+                credential_type="agent",
+                agent_name=agent_name,
+                success=False,
+                error=str(e)
+            )
+
+    # 2. Check legacy location (nested format)
+    if LEGACY_CREDENTIALS_FILE.exists():
+        try:
+            with open(LEGACY_CREDENTIALS_FILE, 'r') as f:
+                data = json.load(f)
+
+            # Check for nested agent data: {"agent-name": {...}}
+            if agent_name in data and isinstance(data[agent_name], dict):
+                agent_data = data[agent_name]
+                # Migrate to new location
+                save_agent_credentials(agent_name, agent_data)
+                security_logger.log_credential_event(
+                    CredEventType.CREDENTIAL_MIGRATED,
+                    credential_type="agent",
+                    agent_name=agent_name,
+                    success=True,
+                    details={"from": "credentials.json (nested)", "to": f"agents/{agent_name}.json"}
+                )
+                return agent_data
+
+            # Check for flat agent data with matching name
+            if data.get("name") == agent_name or data.get("agent_name") == agent_name:
+                save_agent_credentials(agent_name, data)
+                security_logger.log_credential_event(
+                    CredEventType.CREDENTIAL_MIGRATED,
+                    credential_type="agent",
+                    agent_name=agent_name,
+                    success=True,
+                    details={"from": "credentials.json (flat)", "to": f"agents/{agent_name}.json"}
+                )
+                return data
+
+        except Exception:
+            pass
+
+    return None
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create ``path`` with mode 0700, and narrow it to 0700 if it already exists wider."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # A directory written by an earlier SDK version carries the default mode.
+    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        os.chmod(path, 0o700)
+
+
+def save_agent_credentials(agent_name: str, credentials: Dict[str, Any]) -> bool:
+    """
+    Save credentials for a specific agent.
+
+    The agents directory is created with mode 0700 and the agent file with
+    mode 0600; neither is ever readable by other users, not even briefly.
+
+    Args:
+        agent_name: Name of the agent
+        credentials: Agent credentials dict
+
+    Returns:
+        True if saved successfully
+    """
+    try:
+        _ensure_private_dir(AGENTS_DIR)
+
+        # Add schema info
+        credentials["schemaVersion"] = SCHEMA_VERSION
+        credentials["type"] = CredentialType.AGENT
+        credentials["name"] = agent_name
+
+        agent_file = get_agent_credentials_path(agent_name)
+        _write_private_json(agent_file, credentials)
+
+        agent_id = credentials.get("agent_id", "")
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_SAVED,
+            credential_type="agent",
+            agent_name=agent_name,
+            success=True,
+            details={
+                "path": str(agent_file),
+                "permissions": "0600",
+                "agent_id": (agent_id[:8] + "...") if agent_id else None
+            }
+        )
+        return True
+    except Exception as e:
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_SAVED,
+            credential_type="agent",
+            agent_name=agent_name,
+            success=False,
+            error=str(e)
+        )
+        print(f"Warning: Failed to save agent credentials: {e}", file=sys.stderr)
+        return False
+
+
+def delete_agent_credentials(agent_name: str) -> bool:
+    """Delete credentials for a specific agent."""
+    try:
+        agent_file = get_agent_credentials_path(agent_name)
+        if agent_file.exists():
+            agent_file.unlink()
+            security_logger.log_credential_event(
+                CredEventType.CREDENTIAL_DELETED,
+                credential_type="agent",
+                agent_name=agent_name,
+                success=True,
+                details={"path": str(agent_file)}
+            )
+        return True
+    except Exception as e:
+        security_logger.log_credential_event(
+            CredEventType.CREDENTIAL_DELETED,
+            credential_type="agent",
+            agent_name=agent_name,
+            success=False,
+            error=str(e)
+        )
+        return False
+
+
+def list_agent_credentials() -> list:
+    """List all agents with saved credentials."""
+    agents = []
+    if AGENTS_DIR.exists():
+        for f in AGENTS_DIR.glob("*.json"):
+            try:
+                with open(f, 'r') as file:
+                    data = json.load(file)
+                agents.append({
+                    "name": data.get("name", f.stem),
+                    "agent_id": data.get("agent_id") or data.get("agentId"),
+                    "file": str(f)
+                })
+            except Exception:
+                pass
+    return agents
+
+
+def _migrate_legacy_agent_credentials(data: Dict[str, Any]) -> None:
+    """Migrate agent credentials from legacy format to new per-agent files."""
+    try:
+        _ensure_private_dir(AGENTS_DIR)
+
+        # Check for nested format: {"agent-name": {...}}
+        for key, value in data.items():
+            if isinstance(value, dict) and ("agent_id" in value or "private_key" in value):
+                save_agent_credentials(key, value)
+                print(f"[OK] Agent '{key}' credentials migrated to {AGENTS_DIR}", file=sys.stderr)
+
+        # Check for flat format with name field
+        if "agent_id" in data or "private_key" in data:
+            name = data.get("name") or data.get("agent_name") or "default"
+            save_agent_credentials(name, data)
+            print(f"[OK] Agent '{name}' credentials migrated to {AGENTS_DIR}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"Warning: Failed to migrate agent credentials: {e}", file=sys.stderr)
+
+
+# =============================================================================
+# ERROR MESSAGES
+# =============================================================================
+
+def print_sdk_credentials_not_found_error(aim_url: str = "http://localhost:8080") -> None:
+    """Print a clear error message when SDK credentials are not found."""
+    print()
+    print("=" * 72)
+    print("[FAIL] SDK CREDENTIALS NOT FOUND")
+    print("=" * 72)
+    print()
+    print("No SDK authentication credentials found.")
+    print()
+    print("The SDK needs OAuth credentials to authenticate with the AIM server.")
+    print("These are different from agent credentials (which store agent keys).")
+    print()
+    print("TO FIX:")
+    print(f"  1. Visit your AIM dashboard: {aim_url}")
+    print("  2. Go to Developers, then SDK & docs")
+    print("  3. Download the Python SDK")
+    print("  4. Extract and install: pip install -e aim-sdk-python/")
+    print()
+    print("Your downloaded SDK includes authentication credentials.")
+    print("=" * 72)
+    print()
+
+
+def print_wrong_credential_type_error(found_type: str, agent_name: str = None, aim_url: str = "http://localhost:8080") -> None:
+    """Print a clear error message when wrong credential type is found."""
+    print()
+    print("=" * 72)
+    print("Warning: WRONG CREDENTIAL TYPE")
+    print("=" * 72)
+    print()
+
+    if found_type == CredentialType.AGENT:
+        if agent_name:
+            print(f"Found agent credentials for '{agent_name}' but SDK credentials are needed.")
+        else:
+            print("Found agent credentials but SDK credentials are needed.")
+        print()
+        print("Agent credentials (Ed25519 keys for registered agents) and")
+        print("SDK credentials (OAuth tokens for SDK authentication) are different.")
+    else:
+        print("Found unrecognized credential format.")
+
+    print()
+    print("TO FIX:")
+    print(f"  1. Download a fresh SDK from: {aim_url}")
+    print("  2. Go to Developers, then SDK & docs")
+    print("  3. Extract and install: pip install -e aim-sdk-python/")
+    print()
+    print("Your existing agent credentials are safe and unchanged.")
+    print("=" * 72)
+    print()
+
+
+def login_recovery_command(aim_url: str) -> str:
+    """The command that replaces a rejected credential by signing in again.
+
+    --force skips the "Re-authenticate? [y/N]" prompt the stale file would
+    otherwise trigger, and save_sdk_credentials overwrites the file.
+    """
+    return f"aim-sdk login --url {aim_url} --force"
+
+
+def refresh_rejected_fix(credentials: Optional[Dict[str, Any]], aim_url: str) -> str:
+    """One-line recovery instruction for a rejected SDK refresh token."""
+    if detect_credential_origin(credentials) == CredentialOrigin.LOGIN:
+        return f"Sign in again: {login_recovery_command(aim_url)}"
+    return (
+        "Download a fresh SDK from your AIM dashboard (Developers, then SDK & docs), "
+        f"or sign in from this machine: {login_recovery_command(aim_url)}"
+    )
+
+
+def print_token_expired_error(
+    aim_url: str = "http://localhost:8080",
+    credentials: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Print a clear error message when the SDK refresh token is rejected.
+
+    Audit #12: the prior wording told the user to "download a fresh SDK"
+    without explaining WHY the local token stopped working — the most
+    common cause is that another SDK installation rotated the refresh
+    token (server-side rotation invalidates prior copies). This version
+    names the cause and surfaces the local path so recovery is obvious.
+
+    The fix depends on where the credential came from. One written by
+    ``aim-sdk login`` is renewed by signing in again, which overwrites the
+    file. One bundled with a dashboard SDK download is replaced by a fresh
+    download, after removing the stale home copy the SDK would otherwise
+    read first, and its causes include the server's maximum age for a
+    download, which refreshing does not extend. Without ``credentials`` the
+    download text is printed.
+    """
+    origin = detect_credential_origin(credentials)
+    print()
+    print("=" * 72)
+    print("Warning: SDK REFRESH TOKEN REJECTED")
+    print("=" * 72)
+    print()
+    print(f"The AIM server rejected the refresh token at {SDK_CREDENTIALS_FILE}.")
+    if origin == CredentialOrigin.LOGIN:
+        print("This credential was created by `aim-sdk login`.")
+        print()
+        print("WHAT HAPPENED:")
+        print("  The sign-in behind this token is no longer valid. One of these")
+        print("  happened:")
+        print()
+        print("  • The sign-in expired or reached the server's maximum session age.")
+        print("  • The session was signed out or revoked from the dashboard.")
+        print("  • Another installation holding a copy of this file refreshed the")
+        print("    token, and the server only honors the latest one.")
+        print()
+        print("TO RECOVER:")
+        print("  Sign in again. This replaces the stored credential:")
+        print(f"    {login_recovery_command(aim_url)}")
+    else:
+        print()
+        print("WHAT HAPPENED:")
+        print("  The server no longer accepts the refresh token in your local")
+        print("  file. One of these happened:")
+        print()
+        print("  • Another SDK installation (different machine, different venv)")
+        print("    refreshed the token and now holds the current one. The SDK")
+        print("    rotates its refresh token on every successful refresh and")
+        print("    the server only honors the latest one.")
+        print("  • A previously bundled SDK download was used elsewhere.")
+        print("  • The token was revoked manually from the dashboard.")
+        print("  • The refresh token reached its 90-day expiry.")
+        print("  • The SDK download reached the server's maximum age")
+        print("    (SDK_TOKEN_FAMILY_MAX_AGE, 365 days by default). Refreshing")
+        print("    does not extend it; a fresh download starts a new one.")
+        print()
+        print("TO RECOVER:")
+        print(f"  1. Remove the stale file:  rm {SDK_CREDENTIALS_FILE}")
+        print(f"  2. Download a fresh SDK from {aim_url} (Developers, then SDK & docs).")
+        print("  3. Extract and install: pip install -e aim-sdk-python/")
+        print()
+        print("  Or sign in from this machine instead, which replaces the file:")
+        print(f"    {login_recovery_command(aim_url)}")
+    print()
+    print("Your registered agents are not affected; only the SDK auth")
+    print("credential needs replacing. Agent Ed25519 keys are separate and")
+    print("remain valid.")
+    print("=" * 72)
+    print()

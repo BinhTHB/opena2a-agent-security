@@ -1,0 +1,964 @@
+"""
+The Quick start in the root README and in this SDK's README is one Python
+session a reader types top to bottom: sign in, register, verify, one allowed
+call, the strict-mode step, one refused call.
+
+These tests run that example as written: the Python fences, in order, as one
+script in a fresh interpreter (`python -I`), with `aim_sdk` replaced by a
+stand-in module that enforces exactly the capabilities the example declares.
+A name the example uses without defining it raises NameError; a call the
+example never makes is counted as missing; the refused call ends the script
+as it would end a reader's, so it has to be the last line. They also hold
+the minimal dev stack command to the services docker-compose.yml defines,
+the recorded walkthrough's typed and install lines to the root README's Quick
+start, and the root README's captured register output, within 30 lines of
+the ecosystem line, to what this SDK prints for that call and the SDK
+version it names.
+The root README's refused call, and the token-rotation line it describes,
+are run through this SDK against a server on 127.0.0.1.
+
+Everything here runs offline and reads only files in this repository; the
+check of the walkthrough's own extractor also runs it with node, when node
+is installed.
+"""
+
+import ast
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SDK_DIR = Path(__file__).resolve().parent.parent          # .../sdk/python
+REPO_ROOT = SDK_DIR.parent.parent                         # repo root
+ROOT_README = REPO_ROOT / "README.md"
+SDK_README = SDK_DIR / "README.md"
+COMPOSE = REPO_ROOT / "docker-compose.yml"
+TAPE = REPO_ROOT / "docs" / "demo" / "quickstart-selfhosted" / "tape.tape"
+RENDER = REPO_ROOT / "docs" / "demo" / "render.sh"
+EXTRACTOR = REPO_ROOT / "docs" / "demo" / "lib" / "extract-readme.mjs"
+
+READMES = [
+    pytest.param(ROOT_README, id="root-README"),
+    pytest.param(SDK_README, id="sdk-python-README"),
+]
+
+
+def quick_start(path):
+    """The text under `## Quick start` up to the next `## ` heading."""
+    lines = path.read_text(encoding="utf-8").split("\n")
+    start = next(i for i, line in enumerate(lines) if re.match(r"^## quick start\s*$", line, re.IGNORECASE))
+    end = next((i for i, line in enumerate(lines) if i > start and line.startswith("## ")), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def fences(section):
+    """(language, body) for every fenced block in the section, in order."""
+    return [
+        (m.group(1), m.group(2))
+        for m in re.finditer(r"^```(\w*)\n(.*?)^```\s*$", section, re.MULTILINE | re.DOTALL)
+    ]
+
+
+# The stand-in `aim_sdk` the example imports. `secure` records each agent;
+# `perform_action` refuses a capability the agent does not hold with
+# ActionDeniedError, a PermissionError like the SDK's, and never runs the
+# function body for it. At interpreter exit, which also follows an uncaught
+# exception, it writes the agents, their calls (with the script line that made
+# each) and the script's JSON-serialisable module names to result.json next to
+# itself. JSON turns the example's integer dictionary keys into strings.
+STUB_AIM_SDK = '''\
+import atexit
+import json
+import sys
+from pathlib import Path
+
+_agents = []
+
+
+class ActionDeniedError(PermissionError):
+    pass
+
+
+class _Agent:
+    def __init__(self, name, capabilities):
+        self.name = name
+        self.capabilities = list(capabilities or [])
+        self.calls = []
+
+    def perform_action(self, capability, **_):
+        def decorate(fn):
+            def wrapper(*args, **kwargs):
+                line = sys._getframe(1).f_lineno
+                if capability not in self.capabilities:
+                    self.calls.append(["refused", capability, None, line])
+                    raise ActionDeniedError(f"AIM denied {capability!r}")
+                result = fn(*args, **kwargs)
+                self.calls.append(["allowed", capability, result, line])
+                return result
+
+            return wrapper
+
+        return decorate
+
+
+def secure(name, capabilities=None, **_):
+    agent = _Agent(name, capabilities)
+    _agents.append(agent)
+    return agent
+
+
+def _record():
+    names = {}
+    for key, value in vars(sys.modules["__main__"]).items():
+        if key.startswith("_"):
+            continue
+        try:
+            names[key] = json.loads(json.dumps(value))
+        except (TypeError, ValueError):
+            pass
+    Path(__file__).with_name("result.json").write_text(
+        json.dumps({
+            "agents": [
+                {"name": a.name, "capabilities": a.capabilities, "calls": a.calls}
+                for a in _agents
+            ],
+            "main": names,
+        }),
+        encoding="utf-8",
+    )
+
+
+atexit.register(_record)
+'''
+
+# `python -I` puts neither the script's directory nor any environment path on
+# sys.path, so the script itself points at the stand-in before the example's
+# first line. The three names are deleted again: the example must define
+# every name it uses.
+PRELUDE = [
+    "import os as _os, sys as _sys",
+    "_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))",
+    "del _os, _sys",
+]
+
+
+def run_example(path, tmp_path):
+    """Run the Quick start's Python fences, in order, as one script in a fresh interpreter.
+
+    Returns the recorded agents and the script's module names. A script that
+    ends in an error is accepted only when the error is the stand-in's
+    ActionDeniedError raised from the script's last statement: the example's
+    refused call.
+    """
+    blocks = [body for lang, body in fences(quick_start(path)) if lang == "python"]
+    assert blocks, f"{path.name}: the Quick start has no Python fence"
+
+    (tmp_path / "aim_sdk.py").write_text(STUB_AIM_SDK, encoding="utf-8")
+    lines = list(PRELUDE)
+    first_line = []                      # 1-based script line each fence starts on
+    for body in blocks:
+        first_line.append(len(lines) + 1)
+        lines.extend(body.split("\n"))
+    script = tmp_path / "quickstart.py"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    done = subprocess.run(
+        [sys.executable, "-I", "-B", str(script)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if done.returncode != 0:
+        last = done.stderr.strip().split("\n")[-1]
+        assert last.startswith("aim_sdk.ActionDeniedError:"), (
+            f"{path.name}: the Quick start does not run as written:\n{done.stderr}"
+        )
+        raised_on = int(re.search(r'quickstart\.py", line (\d+)', done.stderr).group(1))
+        fence = sum(1 for start in first_line if start <= raised_on)
+        assert fence == len(blocks), (
+            f"{path.name}: the refused call in Python fence {fence} ends the session, "
+            f"so fences {fence + 1} to {len(blocks)} never run"
+        )
+        last = ast.parse(script.read_text(encoding="utf-8")).body[-1]
+        assert last.lineno <= raised_on <= last.end_lineno, (
+            f"{path.name}: the refused call ends the session, so the code after it "
+            f"in the last Python fence never runs"
+        )
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    return result["agents"], result["main"]
+
+
+@pytest.mark.parametrize("path", READMES)
+def test_example_runs_as_written_with_one_allowed_and_one_refused_call(path, tmp_path):
+    agents, names = run_example(path, tmp_path)
+
+    assert len(agents) == 1, f"{path.name}: the example must register exactly one agent"
+    agent = agents[0]
+    assert agent["capabilities"] == ["db:read"], (
+        f"{path.name}: the code must show that the agent holds db:read, "
+        f"got capabilities={agent['capabilities']!r}"
+    )
+    allowed = [c for c in agent["calls"] if c[0] == "allowed"]
+    refused = [c for c in agent["calls"] if c[0] == "refused"]
+    assert [c[1] for c in allowed] == ["db:read"], (
+        f"{path.name}: the example must make exactly one allowed db:read call, got {agent['calls']!r}"
+    )
+    assert [c[1] for c in refused] == ["db:write"], (
+        f"{path.name}: the example must make exactly one refused db:write call, got {agent['calls']!r}"
+    )
+    assert allowed[0][2] == names["customers"]["42"], (
+        f"{path.name}: the allowed call must return the record it reads"
+    )
+    assert "42" in names["customers"], (
+        f"{path.name}: the refused call's body must not have run"
+    )
+
+
+@pytest.mark.parametrize("path", READMES)
+def test_example_uses_no_undefined_database_object(path):
+    section = quick_start(path)
+    assert not re.search(r"\bdb\.(query|execute)\b", section), (
+        f"{path.name}: the Quick start calls a `db` object it never defines"
+    )
+
+
+@pytest.mark.parametrize("path", READMES)
+def test_steps_come_in_the_order_a_reader_can_follow(path):
+    section = quick_start(path)
+    register = section.index("secure(")
+    verify = section.index("until an administrator verifies it under Agents")
+    allowed = section.index("get_customer(42)")
+    strict = section.index("Global Enforcement Mode")
+    refused = section.index("delete_customer(42)")
+    assert register < verify < allowed < strict < refused, (
+        f"{path.name}: the Quick start must read register, verify, allowed call, "
+        f"strict mode, refused call"
+    )
+
+
+def test_both_readmes_sign_in_with_the_same_lines_including_self_hosted():
+    root_bash = [b for lang, b in fences(quick_start(ROOT_README)) if lang == "bash"]
+    sdk_bash = [b for lang, b in fences(quick_start(SDK_README)) if lang == "bash"]
+    assert root_bash and root_bash[0] == sdk_bash[0], (
+        "the root README's sign-in fence must match the SDK README's, byte for byte"
+    )
+    assert "aim-sdk login --url http://localhost:8080" in root_bash[0]
+    assert "`/device`" in quick_start(ROOT_README)
+
+
+# README lines a visitor reads before scrolling, counted from the ecosystem line:
+# the register call and its output sit within 30 lines of the ecosystem line.
+FIRST_SCREEN = 30
+
+
+def ecosystem_line(path):
+    """The 1-based number of the first line that starts with "> **[OpenA2A", the
+    ecosystem line under the README's badges; 0 when there is none."""
+    lines = path.read_text(encoding="utf-8").split("\n")
+    return next((number for number, line in enumerate(lines, 1) if line.startswith("> **[OpenA2A")), 0)
+
+
+def numbered_fences(path):
+    """(language, body, opening line, closing line) for every fenced block, lines 1-based."""
+    blocks = []
+    opened = None
+    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+        if opened is None:
+            m = re.match(r"^```(\w*)\s*$", line)
+            if m:
+                lang, body, opened = m.group(1), [], number
+        elif re.match(r"^```\s*$", line):
+            blocks.append((lang, "\n".join(body), opened, number))
+            opened = None
+        else:
+            body.append(line)
+    return blocks
+
+
+def register_and_output(path):
+    """The Python fence that calls secure(), the fence after it, and the prose before the second."""
+    blocks = numbered_fences(path)
+    i = next((i for i, b in enumerate(blocks) if b[0] == "python" and "secure(" in b[1]), None)
+    assert i is not None, f"{path.name}: no Python fence calls secure()"
+    assert i + 1 < len(blocks), f"{path.name}: nothing follows the register call"
+    lines = path.read_text(encoding="utf-8").split("\n")
+    prose_from = blocks[i - 1][3] if i > 0 else 0
+    prose = "\n".join(
+        line for number, line in enumerate(lines, 1)
+        if prose_from < number < blocks[i + 1][2] and not blocks[i][2] <= number <= blocks[i][3]
+    )
+    return blocks[i], blocks[i + 1], prose
+
+
+def test_root_readme_shows_the_register_call_and_its_dated_output_within_30_lines_of_the_ecosystem_line():
+    register, output, prose = register_and_output(ROOT_README)
+    assert output[0] == "" and "Agent registered:" in output[1], (
+        "the fence after the register call must be its captured output"
+    )
+    ecosystem = ecosystem_line(ROOT_README)
+    assert output[3] <= ecosystem + FIRST_SCREEN, (
+        f"the captured output closes on line {output[3]}; the register call and all of its "
+        f"output must fit within {FIRST_SCREEN} lines of the ecosystem line, line {ecosystem}"
+    )
+    assert "](docs/captures/quick-start.txt)" in prose, (
+        "the text before the captured output must link its sidecar, docs/captures/quick-start.txt"
+    )
+    assert re.fullmatch(r"20\d\d-\d\d-\d\d", register_capture()["capturedAt"]), (
+        "docs/captures/quick-start.json must say when the register output was captured"
+    )
+
+
+SIDECAR = REPO_ROOT / "docs" / "captures" / "quick-start.json"
+
+
+def register_capture():
+    """The sidecar's record of the register call's capture: the README keeps the
+    output and links the sidecar; the date and the SDK version live there."""
+    captures = json.loads(SIDECAR.read_text(encoding="utf-8"))["captures"]
+    return next(c for c in captures if "secure(" in c["command"])
+
+
+# The registration line that carries the agent's version, and the line that stands in
+# for it where the README elides it.
+ID_LINE = re.compile(r"  ID: (?P<id>\S+)  Type: (?P<type>\S+)  Version: (?P<version>\S+)")
+ELIDED = "  ..."
+
+
+# "commit <hash>" in any case, with or without a backtick before the hash, or a
+# bare full-length hash.
+NAMED_COMMIT = re.compile(r"\bcommit\s+`?[0-9a-f]{7,40}\b|\b[0-9a-f]{40}\b", re.IGNORECASE)
+
+
+def test_root_readme_dates_its_captured_output_without_naming_a_commit():
+    """A commit hash in the capture sentence chases the branch it was captured on: the
+    hash exists only there until the branch lands, and lands under a different hash, so a
+    reader following it reaches a commit the repository does not have. The sentence names
+    the date and the repository, not a commit."""
+    _, _, prose = register_and_output(ROOT_README)
+    named = NAMED_COMMIT.findall(prose)
+    assert not named, (
+        f"the text before the captured output names a commit {named!r}; say when it was "
+        "captured and that the server and SDK were built from this repository"
+    )
+
+
+@pytest.mark.parametrize("sentence", [
+    "captured at commit abcdef1 on a self-hosted AIM",
+    "Commit abcdef1 was the build",
+    "captured at commit `abcdef1` on a self-hosted AIM",
+    "captured at COMMIT `ABCDEF1`",
+    "built from 0123456789abcdef0123456789abcdef01234567",
+])
+def test_the_named_commit_guard_catches_each_phrasing_of_a_hash(sentence):
+    assert NAMED_COMMIT.search(sentence), f"the guard misses a commit named as {sentence!r}"
+
+
+@pytest.mark.parametrize("sentence", [
+    "captured on 2026-10-09 with the server and SDK built from this repository",
+    "the SDK reports version 2.0.3",
+    "committed abcdef1",
+    "the commit message",
+])
+def test_the_named_commit_guard_passes_a_sentence_that_names_no_commit(sentence):
+    assert not NAMED_COMMIT.search(sentence), f"the guard flags {sentence!r}, which names no commit"
+
+
+def test_root_readme_names_the_sdk_version_its_captured_output_came_from():
+    """`pip install` fetches the release on PyPI, which can print the registration
+    differently from the SDK in this repository: the aim-sdk 2.0.3 release prints a check
+    mark where this repository's SDK prints [OK], under the same version number. The
+    sidecar names the version, so a reader can tell which SDK printed the lines in the
+    README, and a version bump fails here until the capture is checked again. The README
+    itself names no version: it says which SDK printed the output and how the release on
+    PyPI differs."""
+    section = quick_start(ROOT_README)
+    version = (SDK_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    assert register_capture()["sdk"]["version"] == version, (
+        f"docs/captures/quick-start.json must name the SDK version the register output was "
+        f"captured with, {version} (sdk/python/VERSION)"
+    )
+    assert "built from this repository" in section and "PyPI" in section, (
+        "the text around the captured output must say which SDK printed it and how the "
+        "release on PyPI differs"
+    )
+
+
+# "commit <hash>" in any case, with or without a backtick before the hash, or a
+# bare full-length hash.
+NAMED_COMMIT = re.compile(r"\bcommit\s+`?[0-9a-f]{7,40}\b|\b[0-9a-f]{40}\b", re.IGNORECASE)
+
+
+def test_root_readme_dates_its_captured_output_without_naming_a_commit():
+    """A commit hash in the capture sentence chases the branch it was captured on: the
+    hash exists only there until the branch lands, and lands under a different hash, so a
+    reader following it reaches a commit the repository does not have. The sentence names
+    the date and the repository, not a commit."""
+    _, _, prose = register_and_output(ROOT_README)
+    named = NAMED_COMMIT.findall(prose)
+    assert not named, (
+        f"the text before the captured output names a commit {named!r}; say when it was "
+        "captured and that the server and SDK were built from this repository"
+    )
+
+
+@pytest.mark.parametrize("sentence", [
+    "captured at commit abcdef1 on a self-hosted AIM",
+    "Commit abcdef1 was the build",
+    "captured at commit `abcdef1` on a self-hosted AIM",
+    "captured at COMMIT `ABCDEF1`",
+    "built from 0123456789abcdef0123456789abcdef01234567",
+])
+def test_the_named_commit_guard_catches_each_phrasing_of_a_hash(sentence):
+    assert NAMED_COMMIT.search(sentence), f"the guard misses a commit named as {sentence!r}"
+
+
+@pytest.mark.parametrize("sentence", [
+    "captured on 2026-10-09 with the server and SDK built from this repository",
+    "the SDK reports version 2.0.3",
+    "committed abcdef1",
+    "the commit message",
+])
+def test_the_named_commit_guard_passes_a_sentence_that_names_no_commit(sentence):
+    assert not NAMED_COMMIT.search(sentence), f"the guard flags {sentence!r}, which names no commit"
+
+
+def test_root_readme_installs_the_rich_extra_its_captured_output_shows():
+    # Without rich the SDK prints the registration in an 11-line panel, which
+    # does not fit in the first screen with the commands above it.
+    installs = [
+        line for lang, body in fences(quick_start(ROOT_README)) if lang == "bash"
+        for line in body.split("\n") if line.startswith("pip install")
+    ]
+    assert installs == ['pip install "aim-sdk[rich]"'], (
+        f"the Quick start must install the rich extra its captured output shows, got {installs!r}"
+    )
+
+
+def test_root_readme_says_the_rich_extra_is_optional_and_the_plain_install_works():
+    # setup.py lists rich only under extras_require, and console.py falls back to a
+    # plain-text panel without it, so the bracket is a formatting choice, not a
+    # requirement. A first-time reader learns that on the page, before installing.
+    prose = re.sub(r"^```\w*\n.*?^```\s*$", "", quick_start(ROOT_README), flags=re.MULTILINE | re.DOTALL)
+    sentence = next((s for s in re.split(r"(?<=[.;:])\s+", prose) if "`[rich]`" in s), None)
+    assert sentence and "optional" in sentence, (
+        "the Quick start prose must say that the `[rich]` extra is optional"
+    )
+    assert "`pip install aim-sdk`" in prose, (
+        "the Quick start prose must say that plain `pip install aim-sdk` works"
+    )
+
+
+class MarkupStrippingConsole:
+    """Prints what rich prints for this SDK's console markup, without colour:
+    style tags such as [dim] and [/] dropped, an escaped \\[ printed as [. The
+    comparison below then holds whether or not rich is installed."""
+
+    def print(self, text=""):
+        print(re.sub(r"\\\[|\[/?[a-z0-9 #_]*\]", lambda m: "[" if m.group(0) == "\\[" else "", str(text)))
+
+
+def printed_line_pattern(module, marker):
+    """A regex for the f-string in `module` whose text contains `marker`."""
+    for node in ast.walk(ast.parse(Path(module.__file__).read_text(encoding="utf-8"))):
+        if isinstance(node, ast.JoinedStr):
+            parts = [v.value if isinstance(v, ast.Constant) else None for v in node.values]
+            if marker in "".join(p for p in parts if p is not None):
+                return "".join(".+?" if p is None else re.escape(p) for p in parts)
+    raise AssertionError(f"{module.__name__} has no f-string containing {marker!r}")
+
+
+def test_root_readme_register_output_is_what_this_sdk_prints_for_that_call(monkeypatch, capsys):
+    """Holds the captured lines to the format this SDK prints, and to the call above them:
+    the agent name, its capabilities and the pending status. The values the server returns,
+    the ID, type, version and trust score, are read from the capture and printed back
+    through this SDK's console, so they are not checked: the trust score is computed by the
+    server, and changing "Trust: 59%" to "Trust: 95%" keeps this test green by design.
+    Where the README elides the ID line, its values come from the sidecar's untrimmed capture.
+    The token-rotation line is not part of the capture: it prints only when the server
+    rotates the refresh token (see the test after this one)."""
+    from aim_sdk import console as console_module
+    from aim_sdk import oauth as oauth_module
+
+    register, output, _ = register_and_output(ROOT_README)
+    call = next(
+        node for node in ast.walk(ast.parse(register[1]))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "secure"
+    )
+    name = call.args[0].value
+    capabilities = next(ast.literal_eval(k.value) for k in call.keywords if k.arg == "capabilities")
+
+    lines = output[1].split("\n")
+    detection = re.fullmatch(r"  ○ Agent Type: using default '(\w+)'", lines[0])
+    assert output[0] == "" and detection, (
+        "the fence after the register call must be its captured output, "
+        "opening with the agent-type line secure() prints"
+    )
+    # The first call after `aim-sdk login` refreshes the sign-in. The SDK prints a
+    # line for that only when the server answers with a new refresh token, which a
+    # server without Redis never does, so a capture that shows it is not what every
+    # reader sees.
+    rotation = printed_line_pattern(oauth_module, "Token rotated successfully")
+    assert not [line for line in lines if re.fullmatch(rotation, line)], (
+        "the captured output shows the token-rotation line, which prints only when the "
+        "server rotates the refresh token; describe it below the output instead"
+    )
+    shown = re.fullmatch(
+        r"\n\[OK\] Agent registered: (?P<name>.+)\n"
+        rf"(?P<id_line>{ID_LINE.pattern}|{re.escape(ELIDED)})\n"
+        r"  Status: ○ (?P<status>\S+)  Trust: (?P<trust>\d+)%\n"
+        r"  Capabilities: (?P<capabilities>.+?)\n*",
+        "\n".join(lines[1:]),
+    )
+    assert shown, "the captured output must end with the registration lines the rich extra prints"
+    assert shown["name"] == name, "the captured output names a different agent than the call"
+    assert shown["capabilities"] == ", ".join(capabilities), (
+        "the captured output lists different capabilities than the call grants"
+    )
+    assert shown["status"] == "pending", "a newly registered agent is pending until verified"
+
+    # The README elides the ID line in place, since it carries the agent's version;
+    # the sidecar's untrimmed capture keeps it, and the line printed here must equal it.
+    fields = ID_LINE.fullmatch(shown["id_line"]) or next(
+        (m for m in map(ID_LINE.fullmatch, register_capture()["outputs"]["capture"].split("\n")) if m), None
+    )
+    assert fields, "docs/captures/quick-start.json must keep the ID line the README elides"
+
+    printer = console_module.AIMConsole()
+    printer.console = MarkupStrippingConsole()
+    monkeypatch.setattr(console_module, "RICH_AVAILABLE", True)
+    printer.detection_none("Agent Type", fallback=detection.group(1))
+    printer.agent_registered(
+        name=name,
+        agent_id=fields["id"].replace("...", "-00000000-"),  # shortened back to the captured ID
+        agent_type=fields["type"],
+        version=fields["version"],
+        trust_score=int(shown["trust"]),
+        status=shown["status"],
+        capabilities=capabilities,
+    )
+    printed = capsys.readouterr().out
+    if shown["id_line"] == ELIDED:
+        assert fields.group(0) in printed.split("\n"), (
+            "the ID line in docs/captures/quick-start.json is no longer what this SDK prints; capture it again"
+        )
+        printed = printed.replace(fields.group(0), ELIDED)
+    assert printed.rstrip("\n") == output[1].rstrip("\n"), (
+        "the README's captured register output no longer matches what this SDK prints; "
+        "capture it again"
+    )
+
+
+def paragraph_after(path, block):
+    """The first paragraph after a fenced block, as one line per source line."""
+    lines = path.read_text(encoding="utf-8").split("\n")[block[3]:]
+    start = next(i for i, line in enumerate(lines) if line.strip())
+    end = next((i for i, line in enumerate(lines) if i > start and not line.strip()), len(lines))
+    return "\n".join(lines[start:end])
+
+
+QUICK_START_NOTES = REPO_ROOT / "docs" / "quick-start.md"
+
+
+def quick_start_note(marker):
+    """The one paragraph of the root README's Quick start notes, in docs/quick-start.md,
+    that contains marker."""
+    text = QUICK_START_NOTES.read_text(encoding="utf-8")
+    notes = text[text.index("### Notes on the root README's Quick start"):]
+    found = [p for p in re.split(r"\n\s*\n", notes) if marker in p]
+    assert len(found) == 1, f"docs/quick-start.md must hold one note containing {marker!r}: {found}"
+    return found[0]
+
+
+def test_root_readme_quick_start_leaves_the_token_rotation_line_to_the_notes():
+    """The root README's Quick start shows the capture and what the reader does next.
+    The token-rotation line, which prints only when the server has Redis, is described
+    in the notes docs/quick-start.md holds, not between the capture and the next step."""
+    readme = ROOT_README.read_text(encoding="utf-8")
+    quick_start = readme[readme.index("## Quick start"):readme.index("## ", readme.index("## Quick start") + 1)]
+    assert "Token rotated" not in readme, "the root README does not describe the token-rotation line"
+    assert "Redis" not in quick_start, "the root README's Quick start does not mention Redis"
+
+
+def test_quick_start_notes_say_when_the_sdk_prints_the_token_rotation_line():
+    """The note quotes the line in the format this SDK prints, with the condition it
+    depends on: the server rotates a refresh token only when it has Redis to record the
+    old one as revoked. A server without Redis, or whose Redis could not be reached, logs
+    that at startup and answers with the token it was given."""
+    from aim_sdk import oauth as oauth_module
+
+    prose = quick_start_note("Token rotated successfully")
+    quoted = re.findall(r"`([^`]+)`", prose)
+    rotation = printed_line_pattern(oauth_module, "Token rotated successfully")
+    assert [q for q in quoted if re.fullmatch(rotation, q)], (
+        "the note must quote the token-rotation line in the format this SDK prints"
+    )
+    assert "Redis" in prose, "the note must say the line depends on the server having Redis"
+    server_main = (REPO_ROOT / "apps" / "backend" / "cmd" / "server" / "main.go").read_text(encoding="utf-8")
+    logs = [q for q in quoted if q.startswith("Token revocation disabled")]
+    assert len(logs) == 2 and all(q in server_main for q in logs), (
+        "the note must quote the startup lines a server without Redis and a server whose "
+        "Redis could not be reached log, as the server source writes them"
+    )
+
+
+CAPTURE_TEXT = REPO_ROOT / "docs" / "captures" / "quick-start.txt"
+
+
+def test_full_register_capture_shows_the_token_rotation_line_this_sdk_prints():
+    """The README links docs/captures/quick-start.txt as the register call's full output,
+    and the sidecar says that capture came from the SDK built from this repository, right
+    after `aim-sdk login`, on a server with Redis. Its token-rotation line, and the copy of
+    it the sidecar names as trimmed from the README, must be in the format this SDK prints;
+    a line the SDK no longer prints means the call has to be captured again."""
+    from aim_sdk import oauth as oauth_module
+
+    capture = register_capture()
+    rotation = printed_line_pattern(oauth_module, "Token rotated successfully")
+    shown = [line for line in capture["outputs"]["capture"].split("\n") if line.startswith("Token rotated")]
+    assert len(shown) == 1, "the sidecar's register capture must hold the one token-rotation line it was taken with"
+    assert re.fullmatch(rotation, shown[0]), (
+        f"the sidecar's register capture shows {shown[0]!r}, which is not the token-rotation line "
+        "this SDK prints; capture the register call again"
+    )
+    trimmed = [q for q in re.findall(r"`([^`]+)`", capture["trimmedInReadme"]) if q.startswith("Token rotated")]
+    assert trimmed == shown, "the sidecar must name the rotation line its capture shows as trimmed from the README"
+
+
+def test_full_output_text_holds_each_sidecar_capture_after_its_command():
+    """docs/captures/quick-start.txt is the session the sidecar records: each captured
+    command, typed at the prompt, followed by the output the sidecar keeps for it."""
+    session = CAPTURE_TEXT.read_text(encoding="utf-8")
+    for capture in json.loads(SIDECAR.read_text(encoding="utf-8"))["captures"]:
+        assert f">>> {capture['command']}\n{capture['outputs']['capture']}" in session, (
+            f"docs/captures/quick-start.txt does not show the sidecar's output for {capture['command']!r}"
+        )
+
+
+ROTATION_KEY ="readme-rotation-test-signing-key-0123456789"
+
+
+def _jwt(typ, ttl):
+    import time
+    import uuid
+
+    import jwt
+
+    return jwt.encode(
+        {"user_id": "u-1", "typ": typ, "iss": "agent-identity-management",
+         "jti": str(uuid.uuid4()), "exp": int(time.time()) + ttl},
+        ROTATION_KEY, algorithm="HS256",
+    )
+
+
+class LoopbackServer:
+    """Answers every request on 127.0.0.1 through `answer(method, path, body)`,
+    which returns (status, JSON-serialisable payload)."""
+
+    def __init__(self, answer):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def _respond(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    body = {}
+                status, payload = answer(self.command, self.path, body)
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _respond
+
+            def log_message(self, *args):
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._httpd.server_address[1]}"
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+@pytest.fixture
+def loopback():
+    servers = []
+
+    def start(answer):
+        server = LoopbackServer(answer)
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+@pytest.mark.parametrize("rotates", [True, False], ids=["server-with-redis", "server-without-redis"])
+def test_first_refresh_after_login_prints_the_rotation_line_only_when_the_server_rotates(
+    monkeypatch, tmp_path, capsys, loopback, rotates
+):
+    """What the paragraph after the capture says, run through this SDK: the first token
+    request after `aim-sdk login` presents the saved refresh token. A server with Redis
+    answers with a new refresh token (TestRefreshToken_RotationChainsAndEachOldTokenDies
+    in the backend); one without Redis answers with the token it was given
+    (TestRefreshToken_NoRevokerDoesNotRotate). Only the first prints the line."""
+    import os
+
+    import aim_sdk.credentials as credentials_module
+    import aim_sdk.oauth as oauth_module
+
+    aim_dir = tmp_path / ".aim"
+    creds_file = aim_dir / "sdk_credentials.json"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(credentials_module, "AIM_DIR", aim_dir)
+    monkeypatch.setattr(credentials_module, "SDK_CREDENTIALS_FILE", creds_file)
+    monkeypatch.setattr(credentials_module, "AGENTS_DIR", aim_dir / "agents")
+    monkeypatch.setattr(credentials_module, "LEGACY_CREDENTIALS_FILE", aim_dir / "credentials.json")
+    monkeypatch.setattr(oauth_module, "get_sdk_credentials_path", lambda: creds_file)
+
+    saved = _jwt("refresh", 86400)
+    presented = []
+
+    def answer(method, path, body):
+        if method != "POST" or path != "/api/v1/auth/refresh":
+            return 404, {"error": "not found"}
+        presented.append(body.get("refreshToken"))
+        refresh = _jwt("refresh", 86400) if rotates else body.get("refreshToken")
+        return 200, {"accessToken": _jwt("access", 900), "refreshToken": refresh, "rotated": rotates}
+
+    server = loopback(answer)
+    # The shape `aim-sdk login` saves.
+    aim_dir.mkdir(parents=True)
+    creds_file.write_text(json.dumps({
+        "aimUrl": server.url, "refreshToken": saved, "accessToken": _jwt("access", 900),
+        "userId": "u-1", "userEmail": "user@example.test", "organizationId": "o-1",
+        "type": "sdk_oauth", "schemaVersion": "1.0",
+    }))
+    os.chmod(creds_file, 0o600)
+
+    assert oauth_module.OAuthTokenManager().get_access_token()
+    assert presented == [saved], "the first token request after login presents the saved refresh token"
+
+    rotation = printed_line_pattern(oauth_module, "Token rotated successfully")
+    printed = [line for line in capsys.readouterr().out.split("\n") if re.fullmatch(rotation, line)]
+    if rotates:
+        assert len(printed) == 1, "a rotated refresh token prints the rotation line once"
+        assert printed[0].startswith("Token rotated successfully. Old refresh token revoked (new id: "), (
+            "the rotation line reads as two sentences, with no dash between them"
+        )
+        assert "—" not in printed[0]
+    else:
+        assert printed == [], (
+            "a server that answers with the refresh token it was given rotated nothing, "
+            "and the SDK prints no rotation line"
+        )
+
+
+def refused_call_and_output(path):
+    """The Python fence that makes the refused call, and the fence after it."""
+    blocks = numbered_fences(path)
+    i = next(
+        (i for i, b in enumerate(blocks) if b[0] == "python" and "perform_action" in b[1] and "db:write" in b[1]),
+        None,
+    )
+    assert i is not None and i + 1 < len(blocks), f"{path.name}: no fence follows the refused call"
+    return blocks[i], blocks[i + 1]
+
+
+def test_root_readme_strict_mode_refusal_is_what_this_sdk_prints(monkeypatch, capsys, loopback):
+    """Runs the refused call through this SDK's @perform_action against a server that
+    answers as a strict-mode organization does: the capability request is left pending
+    (202, status pending, the backend's RegisterCapability) and the verification is
+    denied. The denial reason the server writes is read from the README's own exception
+    line and sent back, so it is not checked; every other line, and the rest of the
+    exception line, is what this SDK prints."""
+    import uuid
+
+    from aim_sdk import console as console_module
+    from aim_sdk.client import AIMClient
+    from aim_sdk.decision import get_mode_cache
+    from aim_sdk.exceptions import ActionDeniedError
+
+    refused, output = refused_call_and_output(ROOT_README)
+    capability = next(
+        k.value.value
+        for node in ast.walk(ast.parse(refused[1]))
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "perform_action"
+        for k in node.keywords if k.arg == "capability"
+    )
+    lines = output[1].rstrip("\n").split("\n")
+    raised = re.fullmatch(
+        rf"(?P<type>[\w.]+): AIM denied '{re.escape(capability)}': (?P<reason>.+?)\. "
+        r"The action was blocked and not executed\. .+",
+        lines[-1],
+    )
+    assert raised, "the output of the refused call must end with the ActionDeniedError it raises"
+
+    def answer(method, path, body):
+        if path.endswith("/capabilities/register"):
+            return 202, {
+                "success": True, "capabilityType": body.get("capabilityType"), "status": "pending",
+                "message": "Capability request created - awaiting admin approval (strict mode)",
+                "requestId": str(uuid.uuid4()),
+            }
+        if path.endswith("/sdk-api/verifications"):
+            return 200, {"id": str(uuid.uuid4()), "status": "denied",
+                         "denialReason": raised["reason"], "enforcementMode": "strict"}
+        return 200, {}
+
+    server = loopback(answer)
+    get_mode_cache().clear()
+    monkeypatch.setattr(console_module, "RICH_AVAILABLE", True)
+    monkeypatch.setattr(console_module.console, "console", MarkupStrippingConsole(), raising=False)
+    agent = AIMClient(agent_id=str(uuid.uuid4()), api_key="test-api-key", aim_url=server.url, auto_retry=False)
+    capsys.readouterr()
+
+    @agent.perform_action(capability=capability)
+    def refused_call():
+        raise AssertionError("the function body ran for a refused call")
+
+    try:
+        with pytest.raises(ActionDeniedError) as denied:
+            refused_call()
+    finally:
+        get_mode_cache().clear()
+    printed = capsys.readouterr()
+    error = denied.value
+    shown = printed.out.rstrip("\n").split("\n") + [f"{type(error).__module__}.{type(error).__name__}: {error}"]
+    assert printed.err == "", f"the refused call also wrote to stderr: {printed.err!r}"
+    assert shown == lines, (
+        "the README's output for the refused call no longer matches what this SDK prints"
+    )
+
+
+def test_root_readme_drops_the_stale_self_hosted_sentence():
+    assert "do not yet complete" not in ROOT_README.read_text(encoding="utf-8")
+
+
+def compose_services():
+    lines = COMPOSE.read_text(encoding="utf-8").split("\n")
+    start = lines.index("services:")
+    services = set()
+    for line in lines[start + 1:]:
+        if re.match(r"^\S", line):
+            break
+        m = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", line)
+        if m:
+            services.add(m.group(1))
+    return services
+
+
+DEPLOYMENT = REPO_ROOT / "docs" / "DEPLOYMENT.md"
+
+
+def test_minimal_dev_stack_command_names_services_the_compose_file_defines():
+    """The root README's Install section links docs/DEPLOYMENT.md for building from
+    source; the minimal dev stack command lives there."""
+    assert "](docs/DEPLOYMENT.md#install-from-this-repository)" in ROOT_README.read_text(encoding="utf-8"), (
+        "the README's Install section must link the from-source steps in docs/DEPLOYMENT.md"
+    )
+    commands = re.findall(
+        r"^docker compose up -d (\S.*)$", DEPLOYMENT.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    # Service names only: a flag such as --build names no service.
+    named = [s for c in commands for s in c.split() if not s.startswith("-")]
+    assert named, "docs/DEPLOYMENT.md must keep the minimal dev stack command"
+    services = compose_services()
+    missing = [s for s in named if s not in services]
+    assert not missing, (
+        f"docker compose would fail with 'no such service' for {missing}; "
+        f"docker-compose.yml defines {sorted(services)}"
+    )
+
+
+TYPED_FENCES = ("bash", "python")  # any other fence, or one with no language, is captured output
+
+
+def readme_code_lines():
+    """The lines the walkthrough may type, extracted as docs/demo/lib/extract-readme.mjs does:
+    the lines of the Quick start's bash and python fences, without a trailing comment."""
+    out = set()
+    for lang, body in fences(quick_start(ROOT_README)):
+        if lang not in TYPED_FENCES:
+            continue
+        for raw in body.split("\n"):
+            line = re.sub(r"\s+#.*$", "", raw).rstrip()
+            if line.strip():
+                out.add(line)
+    return out
+
+
+def node_extractor_lines():
+    """The lines docs/demo/lib/extract-readme.mjs extracts from the root README."""
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    run = subprocess.run(
+        ["node", str(EXTRACTOR), str(ROOT_README)],
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    return set(json.loads(run.stdout)["lines"])
+
+
+def captured_output_lines():
+    """Lines of the Quick start's other fences that no bash or python fence also holds."""
+    captured = set()
+    for lang, body in fences(quick_start(ROOT_README)):
+        if lang not in TYPED_FENCES:
+            captured |= {line.rstrip() for line in body.split("\n") if line.strip()}
+    return captured - readme_code_lines()
+
+
+@pytest.mark.parametrize("extract", [
+    pytest.param(readme_code_lines, id="python-mirror"),
+    pytest.param(node_extractor_lines, id="extract-readme.mjs"),
+])
+def test_walkthrough_may_not_type_the_quick_start_captured_output(extract):
+    captured = captured_output_lines()
+    assert "[OK] Agent registered: my-first-agent" in captured, (
+        "the root README's register output is no longer an unlabelled fence in its Quick start"
+    )
+    typeable = sorted(captured & extract())
+    assert not typeable, f"captured output lines the walkthrough may type: {typeable}"
+
+
+def test_walkthrough_extractor_and_its_python_mirror_agree():
+    assert node_extractor_lines() == readme_code_lines(), (
+        "docs/demo/lib/extract-readme.mjs and readme_code_lines() extract different lines"
+    )
+
+
+def test_walkthrough_types_only_root_readme_quick_start_lines():
+    allowed = readme_code_lines()
+    hidden = False
+    stray = []
+    for number, line in enumerate(TAPE.read_text(encoding="utf-8").split("\n"), 1):
+        t = line.strip()
+        if re.match(r"^Hide\b", t):
+            hidden = True
+        if re.match(r"^Show\b", t):
+            hidden = False
+        m = re.match(r"""^Type\s+(["'])(.*)\1\s*$""", t)
+        if m and not hidden and m.group(2) not in allowed:
+            stray.append(f"tape.tape:{number}: {m.group(2)}")
+    assert not stray, "typed lines that are not in the README Quick start:\n" + "\n".join(stray)
+
+
+def test_walkthrough_render_types_the_root_readme_install_line():
+    # render.sh puts the install step into the tape at render time, inside a
+    # shell-quoted string, so the tape test above never sees it.
+    typed = re.findall(r"""\\nType (?:'"'"'|")(pip install .*?)(?:'"'"'|")\\n""", RENDER.read_text(encoding="utf-8"))
+    assert typed, "render.sh no longer types an install line"
+    stray = sorted(set(typed) - readme_code_lines())
+    assert not stray, f"render.sh types install lines that are not in the README Quick start: {stray}"
