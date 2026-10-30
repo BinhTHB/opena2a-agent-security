@@ -19,6 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.venv/
+venv/
+env/
 
 # Testing
 .pytest_cache/
@@ -37,3 +40,23 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets — mỗi máy một file .env, không đẩy lên git
+.env
+.env.local
+.env.*.local
+setup_creds.py
+!.env.example
+
+# Word lock / bản sao lưu soạn thảo
+~$*
+back-up-docx/
+
+# Dữ liệu runtime của lab (tự tạo lại khi chạy demo)
+experiments/data/*.db
+experiments/data/*.jsonl
+experiments/results/*.log
+audit_log.json
+
+# SDK credentials trên máy local
+.aim/

@@ -1,6 +1,8 @@
 # TIỂU LUẬN MÔN HỌC: AN TOÀN DỮ LIỆU
 ## ĐỀ TÀI: NGHIÊN CỨU & TRIỂN KHAI CƠ CHẾ BẢO MẬT, ĐỊNH DANH VÀ PHÂN QUYỀN CHO AI AGENT SỬ DỤNG CHUẨN OPENA2A
 
+**Chạy demo trên máy thành viên / khi bảo vệ:** làm theo [HUONG_DAN_DEMO.md](HUONG_DAN_DEMO.md). Sao chép `.env.example` thành `.env`, không commit khóa API hay mật khẩu.
+
 ---
 
 ## 📌 1. THÔNG TIN ĐỀ TÀI & NHÓM THỰC HIỆN
@@ -82,6 +84,11 @@ Toàn bộ dự án đã được cô đọng, loại bỏ các thành phần r�
 ```text
 opena2a-agent-security/
 │
+├── .env.example                     # Mẫu biến môi trường; copy thành .env trên mỗi máy
+├── docker-compose.quickstart.yml    # Postgres + Redis + AIM server + dashboard
+├── lab_env.py                       # Nạp .env cho các script Python
+├── HUONG_DAN_DEMO.md                # Hướng dẫn chạy demo thủ công từng bước
+│
 ├── aim_sdk/                         # Thư viện bảo mật cốt lõi OpenA2A (Trọng tâm BTL)
 │   ├── decision.py                  # Định nghĩa VerificationDecision, Outcome, EnforcementMode
 │   ├── enforcement.py               # Bộ máy thẩm định an ninh evaluate() và Verdict
@@ -91,9 +98,13 @@ opena2a-agent-security/
 │   ├── telemetry/                   # Module ghi vết kiểm toán & Ma trận Threat Matrix
 │   └── ...                          # Các thành phần quản lý khóa và mật mã
 │
-├── app_demo.py                      # Giao diện trực quan Streamlit phục vụ thuyết trình/báo cáo
-├── university_database.db           # Cơ sở dữ liệu SQLite thực tế lưu bảng điểm sinh viên
-├── requirements.txt                 # Danh sách thư viện Python cần thiết
+├── app_demo.py                      # Giao diện Streamlit phục vụ thuyết trình
+├── demo_btl_atdl.py                 # Demo console: Ed25519, phân quyền, chặn prompt injection
+├── kiem_thu_toan_dien.py            # Runner kiểm thử SDK và demo cục bộ
+├── experiments/                     # Ba demo trên stack AIM (CRUD, RAG, đa tác tử) + ảnh
+├── BaoCao_ThucNghiem_OpenA2A.docx   # Tiểu luận thực nghiệm, ảnh dashboard đã nhúng
+├── university_database.db           # CSDL SQLite bảng điểm (Streamlit tự seed nếu thiếu)
+├── requirements.txt                 # Thư viện Python (SDK + Streamlit)
 └── README.md                        # Tài liệu thuyết minh dự án tiểu luận
 ```
 
@@ -101,23 +112,28 @@ opena2a-agent-security/
 
 ## 🚀 5. HƯỚNG DẪN CÀI ĐẶT & CHẠY ỨNG DỤNG DEMO
 
-### 5.1. Yêu cầu môi trường
-* Python 3.10 trở lên.
-* Hệ điều hành: Windows / macOS / Linux.
+Chi tiết từng bước (Streamlit, console, Docker AIM, dashboard): **[HUONG_DAN_DEMO.md](HUONG_DAN_DEMO.md)**.
 
-### 5.2. Cài đặt các thư viện phụ trợ
-Mở terminal tại thư mục dự án và chạy lệnh:
-```bash
-pip install streamlit pynacl pandas
-```
-*(Lưu ý: Dự án sử dụng trực tiếp mã nguồn trong thư mục cục bộ `./aim_sdk`, không cần cài đặt package ngoài qua pip).*
+Tóm tắt tối thiểu trên máy mới:
 
-### 5.3. Khởi chạy giao diện Demo trực quan
 ```bash
+python -m venv .venv
+# Windows: .\.venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # Windows: Copy-Item .env.example .env
 streamlit run app_demo.py --server.port 8502
 ```
-Sau khi khởi động thành công, mở trình duyệt truy cập địa chỉ:
-👉 **`http://localhost:8502`**
+
+Mở `http://localhost:8502`. SDK dùng mã trong `./aim_sdk`, không cần `pip install aim-sdk`.
+
+Ba kịch bản AIM (CRUD / RAG / đa tác tử) chạy **từng bước** trên stack Docker:
+
+```bash
+streamlit run app_aim_lab.py --server.port 8503
+```
+
+Mở `http://localhost:8503`. Chi tiết nút bấm: [HUONG_DAN_DEMO.md](HUONG_DAN_DEMO.md) mục 4.3.
 
 ---
 
